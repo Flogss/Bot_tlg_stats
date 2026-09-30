@@ -24,9 +24,13 @@ from card import Entry, format_eur, render
 
 load_dotenv()
 
-TOKEN = os.environ["BOT_TOKEN"]
+TOKEN = os.environ.get("BOT_TOKEN")
+if not TOKEN:
+    raise SystemExit("BOT_TOKEN manquant : ajoute-le dans les variables d'environnement (ou dans .env).")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "8925708293"))
-DATA_FILE = os.environ.get("DATA_FILE", os.path.join(os.path.dirname(__file__), "data.json"))
+# Sur Railway, si un volume est monté, on y stocke les données pour qu'elles survivent aux redéploiements.
+_default_dir = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH") or os.path.dirname(os.path.abspath(__file__))
+DATA_FILE = os.environ.get("DATA_FILE", os.path.join(_default_dir, "data.json"))
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
