@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import os
 import re
+import time
 
 from dotenv import load_dotenv
 from telegram import (
@@ -20,7 +22,7 @@ from telegram import (
 from telegram.constants import ChatType
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-from card import Entry, format_eur, render
+from card import Entry, format_eur, render, warmup
 
 load_dotenv()
 
@@ -133,16 +135,40 @@ async def resolve_target(update: Update, data: dict, args: list[str]) -> tuple[s
     return None, None, rest
 
 
+AVATAR_TTL = 30 * 60  # on garde les photos de profil 30 min en mémoire
+_avatar_cache: dict[int, tuple[float, bytes | None]] = {}
+
+
 async def fetch_avatar(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bytes | None:
+    cached = _avatar_cache.get(user_id)
+    if cached and time.monotonic() - cached[0] < AVATAR_TTL:
+        return cached[1]
+    avatar = None
     try:
         photos = await context.bot.get_user_profile_photos(user_id, limit=1)
-        if not photos.total_count:
-            return None
-        file = await photos.photos[0][-1].get_file()
-        return bytes(await file.download_as_bytearray())
+        if photos.total_count:
+            # taille moyenne (~320px) : largement suffisant pour l'image, plus rapide à télécharger
+            sizes = photos.photos[0]
+            photo = next((p for p in sizes if p.width >= 300), sizes[-1])
+            file = await photo.get_file()
+            avatar = bytes(await file.download_as_bytearray())
     except Exception as e:
         log.info("Pas d'avatar pour %s : %s", user_id, e)
-        return None
+    _avatar_cache[user_id] = (time.monotonic(), avatar)
+    return avatar
+
+
+async def build_card(context: ContextTypes.DEFAULT_TYPE, data: dict) -> tuple[bytes, float, list]:
+    users = [(uid, u) for uid, u in data["users"].items() if u.get("amount", 0) != 0]
+    users.sort(key=lambda x: x[1]["amount"], reverse=True)
+    total = sum(u["amount"] for _, u in users)
+    avatars = await asyncio.gather(*(fetch_avatar(context, int(uid)) for uid, _ in users[:10]))
+    entries = [
+        Entry(u.get("name", uid), u["amount"], avatars[i] if i < len(avatars) else None)
+        for i, (uid, u) in enumerate(users)
+    ]
+    image = await asyncio.to_thread(render, entries, total)
+    return image, total, users
 
 
 async def ensure_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -198,12 +224,15 @@ async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         data = load()
         rec = upsert_user(data, update.effective_user)
         rec["amount"] = round(rec["amount"] + amount, 2)
-        total = sum(u["amount"] for u in data["users"].values())
         save(data)
 
-    await msg.reply_html(
-        f"✅ <b>+{format_eur(amount)}</b> pour {rec['name']}\n"
-        f"Ton total : <b>{format_eur(rec['amount'])}</b> · Cagnotte : <b>{format_eur(total)}</b>"
+    await context.bot.send_chat_action(update.effective_chat.id, "upload_photo")
+    image, total, _ = await build_card(context, data)
+    await msg.reply_photo(
+        image,
+        caption=f"✅ <b>+{format_eur(amount)}</b> pour {html.escape(rec['name'])} · "
+                f"total : <b>{format_eur(rec['amount'])}</b>",
+        parse_mode="HTML",
     )
 
 
@@ -211,21 +240,12 @@ async def cmd_cagnotte(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await ensure_admin_menu(update, context)
     async with _lock:
         data = load()
-    users = [(uid, u) for uid, u in data["users"].items() if u.get("amount", 0) != 0]
-    users.sort(key=lambda x: x[1]["amount"], reverse=True)
-    total = sum(u["amount"] for _, u in users)
-
     await context.bot.send_chat_action(update.effective_chat.id, "upload_photo")
-    avatars = await asyncio.gather(*(fetch_avatar(context, int(uid)) for uid, _ in users[:10]))
-    entries = [
-        Entry(u.get("name", uid), u["amount"], avatars[i] if i < len(avatars) else None)
-        for i, (uid, u) in enumerate(users)
-    ]
-    image = await asyncio.to_thread(render, entries, total)
+    image, total, users = await build_card(context, data)
 
     caption = f"💰 Cagnotte : <b>{format_eur(total)}</b>"
     if users:
-        caption += f"\n👑 En tête : <b>{users[0][1].get('name')}</b> ({format_eur(users[0][1]['amount'])})"
+        caption += f"\n👑 En tête : <b>{html.escape(users[0][1].get('name', ''))}</b> ({format_eur(users[0][1]['amount'])})"
     await update.effective_message.reply_photo(image, caption=caption, parse_mode="HTML")
 
 
@@ -252,7 +272,7 @@ async def cmd_solde(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         data["users"][uid]["amount"] = amount
         save(data)
-    await msg.reply_html(f"✏️ Solde de <b>{name}</b> fixé à <b>{format_eur(amount)}</b>")
+    await msg.reply_html(f"✏️ Solde de <b>{html.escape(name)}</b> fixé à <b>{format_eur(amount)}</b>")
 
 
 async def cmd_ajouter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -271,7 +291,7 @@ async def cmd_ajouter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         rec["amount"] = round(rec.get("amount", 0) + amount, 2)
         save(data)
     sign = "+" if amount >= 0 else ""
-    await msg.reply_html(f"✏️ {sign}{format_eur(amount)} pour <b>{name}</b> → <b>{format_eur(rec['amount'])}</b>")
+    await msg.reply_html(f"✏️ {sign}{format_eur(amount)} pour <b>{html.escape(name)}</b> → <b>{format_eur(rec['amount'])}</b>")
 
 
 async def cmd_supprimer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -287,7 +307,7 @@ async def cmd_supprimer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return
         data["users"].pop(uid, None)
         save(data)
-    await msg.reply_html(f"🗑 <b>{name}</b> a été retiré du top.")
+    await msg.reply_html(f"🗑 <b>{html.escape(name)}</b> a été retiré du top.")
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -310,6 +330,7 @@ async def post_init(app: Application) -> None:
         await app.bot.set_my_commands(ADMIN_COMMANDS, scope=BotCommandScopeChat(ADMIN_ID))
     except Exception as e:
         log.warning("Menu admin en privé non défini (l'admin doit d'abord démarrer le bot) : %s", e)
+    await asyncio.to_thread(warmup)
     log.info("Bot démarré en tant que @%s", app.bot.username)
 
 

@@ -121,13 +121,23 @@ def _gradient(w: int, h: int, top: tuple, bottom: tuple) -> Image.Image:
     return base.resize((w, h), Image.BICUBIC)
 
 
+@lru_cache(maxsize=64)
+def _glow_sprite(radius: int, color: tuple, alpha: int) -> Image.Image:
+    # le flou est calculé en basse résolution puis agrandi : visuellement identique, bien plus rapide
+    k = 4
+    pad = radius // k
+    r = radius // k
+    n = 2 * (r + 2 * pad)
+    layer = Image.new("RGBA", (n, n), color + (0,))
+    ImageDraw.Draw(layer).ellipse((2 * pad, 2 * pad, 2 * pad + 2 * r, 2 * pad + 2 * r), fill=color + (alpha,))
+    layer = layer.filter(ImageFilter.GaussianBlur(max(1, r // 2)))
+    return layer.resize((n * k, n * k), Image.BILINEAR)
+
+
 def _glow(img: Image.Image, center: tuple[int, int], radius: int, color: tuple, alpha: int) -> None:
-    layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    d = ImageDraw.Draw(layer)
+    sprite = _glow_sprite(radius, color, alpha)
     x, y = center
-    d.ellipse((x - radius, y - radius, x + radius, y + radius), fill=color + (alpha,))
-    layer = layer.filter(ImageFilter.GaussianBlur(radius // 2))
-    img.paste(layer, (0, 0), layer)
+    img.paste(sprite, (x - sprite.width // 2, y - sprite.height // 2), sprite)
 
 
 def _initials_avatar(name: str, size: int, color: tuple) -> Image.Image:
@@ -170,10 +180,12 @@ def _circle_avatar(entry: Entry, size: int, ring: tuple, ring_w: int) -> Image.I
 
 
 def _shadow(img: Image.Image, box: tuple, radius: int, blur: int = 18, alpha: int = 110) -> None:
-    layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    ImageDraw.Draw(layer).rounded_rectangle(box, radius=radius, fill=(0, 0, 0, alpha))
+    pad = blur * 3
+    x0, y0, x1, y1 = (int(v) for v in box)
+    layer = Image.new("RGBA", (x1 - x0 + 2 * pad, y1 - y0 + 2 * pad), (0, 0, 0, 0))
+    ImageDraw.Draw(layer).rounded_rectangle((pad, pad, pad + x1 - x0, pad + y1 - y0), radius=radius, fill=(0, 0, 0, alpha))
     layer = layer.filter(ImageFilter.GaussianBlur(blur))
-    img.paste(layer, (0, 0), layer)
+    img.paste(layer, (x0 - pad, y0 - pad), layer)
 
 
 def _crown(draw: ImageDraw.ImageDraw, cx: int, bottom: int, w: int) -> None:
@@ -191,6 +203,21 @@ def _crown(draw: ImageDraw.ImageDraw, cx: int, bottom: int, w: int) -> None:
     draw.rectangle((x0, bottom - h * 0.16, x1, bottom), fill=(232, 170, 40))
 
 
+@lru_cache(maxsize=16)
+def _background(height: int, header_h: int) -> Image.Image:
+    img = _gradient(WIDTH, height, (30, 16, 64), (10, 10, 28))
+    _glow(img, (160, 120), 260, (140, 82, 255), 120)
+    _glow(img, (WIDTH - 120, 420), 280, (255, 90, 170), 70)
+    _glow(img, (WIDTH // 2, header_h + 200), 320, (255, 200, 80), 45)
+    return img
+
+
+def warmup() -> None:
+    """Précharge polices et fonds pour que la première image soit rapide."""
+    for n in (0, 1, 3, 10):
+        render([Entry(f"x{i}", 1) for i in range(n)], n)
+
+
 def render(entries: list[Entry], total: float, title: str = "CAGNOTTE") -> bytes:
     entries = sorted(entries, key=lambda e: e.amount, reverse=True)
     podium = entries[:3]
@@ -203,10 +230,7 @@ def render(entries: list[Entry], total: float, title: str = "CAGNOTTE") -> bytes
     footer_h = 90
     height = header_h + podium_h + rest_h + footer_h
 
-    img = _gradient(WIDTH, height, (30, 16, 64), (10, 10, 28))
-    _glow(img, (160, 120), 260, (140, 82, 255), 120)
-    _glow(img, (WIDTH - 120, 420), 280, (255, 90, 170), 70)
-    _glow(img, (WIDTH // 2, header_h + 200), 320, (255, 200, 80), 45)
+    img = _background(height, header_h).copy()
     d = ImageDraw.Draw(img, "RGBA")
 
     # --- En-tête ---
@@ -218,10 +242,10 @@ def render(entries: list[Entry], total: float, title: str = "CAGNOTTE") -> bytes
     while _width(total_txt, f_total) > WIDTH - 120 and f_total.size > 60:
         f_total = _font(f_total.size - 6, "black")
     # léger halo doré derrière le montant
-    halo = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    _text(ImageDraw.Draw(halo), (WIDTH / 2, 205), total_txt, font=f_total, fill=GOLD + (150,), anchor="mm")
-    halo = halo.filter(ImageFilter.GaussianBlur(22))
-    img.paste(halo, (0, 0), halo)
+    halo = Image.new("RGBA", (WIDTH, 260), GOLD + (0,))
+    _text(ImageDraw.Draw(halo), (WIDTH / 2, 130), total_txt, font=f_total, fill=GOLD + (150,), anchor="mm")
+    halo = halo.resize((WIDTH // 4, 65)).filter(ImageFilter.GaussianBlur(5)).resize((WIDTH, 260), Image.BILINEAR)
+    img.paste(halo, (0, 75), halo)
     d = ImageDraw.Draw(img, "RGBA")
     _text(d, (WIDTH / 2, 205), total_txt, font=f_total, fill=GOLD, anchor="mm")
     n = len(entries)
@@ -308,5 +332,5 @@ def render(entries: list[Entry], total: float, title: str = "CAGNOTTE") -> bytes
     _text(d, (WIDTH / 2, height - footer_h / 2), footer, font=_font(28), fill=MUTED, anchor="mm")
 
     out = io.BytesIO()
-    img.save(out, format="PNG", optimize=True)
+    img.save(out, format="JPEG", quality=93, subsampling=0)
     return out.getvalue()
