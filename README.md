@@ -28,4 +28,4 @@ python bot.py
 Les données sont stockées dans `data.json`.
 
 > Dans un groupe, le bot doit pouvoir lire les commandes (par défaut c'est le cas pour les messages commençant par `/`).
-> Polices : place `fonts/bold.ttf` et `fonts/black.ttf` pour personnaliser, sinon les polices système sont utilisées (sous Linux : `apt install fonts-dejavu-core`).
+> Polices incluses dans `fonts/` (licences libres OFL / DejaVu) : Montserrat pour le texte, puis DejaVu Sans, Noto Sans Math et Noto Emoji en secours caractère par caractère, pour afficher `€`, les pseudos stylés (`ꜰᴇᴜʀᴍᴀɴ {𝘃𝟮 𝗯𝗶𝗼}`) et les emojis.

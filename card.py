@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import io
 import os
+import unicodedata
 from dataclasses import dataclass
+from functools import lru_cache
 
+from fontTools.ttLib import TTFont
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 WIDTH = 1080
@@ -18,19 +21,74 @@ WHITE = (255, 255, 255)
 MUTED = (168, 160, 200)
 MEDAL_COLORS = [GOLD, SILVER, BRONZE]
 
-FONT_DIR = os.path.join(os.path.dirname(__file__), "fonts")
-BOLD_CANDIDATES = [
-    os.path.join(FONT_DIR, "bold.ttf"),
-    "/System/Library/Fonts/Supplemental/Arial Rounded Bold.ttf",
-    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-    "C:/Windows/Fonts/arialbd.ttf",
-]
-BLACK_CANDIDATES = [
-    os.path.join(FONT_DIR, "black.ttf"),
-    "/System/Library/Fonts/Supplemental/Arial Black.ttf",
-] + BOLD_CANDIDATES
+FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+# Police principale puis polices de secours, testées caractère par caractère
+# (petites capitales ꜰᴇᴜʀ, lettres mathématiques 𝘃𝟮 𝗯𝗶𝗼, emojis…).
+FALLBACK_FONTS = ["DejaVuSans-Bold.ttf", "NotoSansMath-Regular.ttf", "NotoEmoji.ttf"]
+PRIMARY_FONTS = {"bold": "Montserrat-Bold.ttf", "black": "Montserrat-Black.ttf"}
+# Caractères invisibles (sélecteurs de variante, ZWJ…) qu'on ignore s'ils n'ont pas de glyphe
+_INVISIBLE = {"Mn", "Me", "Cf"}
+
+
+@lru_cache(maxsize=None)
+def _cmap(filename: str) -> frozenset[int]:
+    return frozenset(TTFont(os.path.join(FONT_DIR, filename), lazy=True).getBestCmap())
+
+
+@lru_cache(maxsize=None)
+def _truetype(filename: str, size: int) -> ImageFont.FreeTypeFont:
+    return ImageFont.truetype(os.path.join(FONT_DIR, filename), size)
+
+
+class RichFont:
+    """Police avec repli automatique par caractère."""
+
+    def __init__(self, size: int, weight: str = "bold"):
+        self.size = size
+        self.files = [PRIMARY_FONTS[weight]] + FALLBACK_FONTS
+
+    def runs(self, text: str) -> list[tuple[str, ImageFont.FreeTypeFont]]:
+        runs: list[tuple[str, ImageFont.FreeTypeFont]] = []
+        for ch in text:
+            filename = next((f for f in self.files if ord(ch) in _cmap(f)), None)
+            if filename is None:
+                if unicodedata.category(ch) in _INVISIBLE:
+                    continue
+                filename = self.files[1]  # glyphe manquant : DejaVu affiche un carré propre
+            font = _truetype(filename, self.size)
+            if runs and runs[-1][1] is font:
+                runs[-1] = (runs[-1][0] + ch, font)
+            else:
+                runs.append((ch, font))
+        return runs
+
+    @property
+    def primary(self) -> ImageFont.FreeTypeFont:
+        return _truetype(self.files[0], self.size)
+
+
+def _font(size: int, weight: str = "bold") -> RichFont:
+    return RichFont(size, weight)
+
+
+def _width(text: str, font: RichFont) -> float:
+    return sum(f.getlength(t) for t, f in font.runs(text))
+
+
+def _text(draw: ImageDraw.ImageDraw, xy, text: str, font: RichFont, fill, anchor: str = "la") -> None:
+    """Dessine du texte multi-polices ; anchor = (l|m|r)(m) comme Pillow."""
+    x, y = xy
+    w = _width(text, font)
+    if anchor[0] == "m":
+        x -= w / 2
+    elif anchor[0] == "r":
+        x -= w
+    # ligne de base commune calée sur la police principale pour un centrage vertical stable
+    top, bottom = font.primary.getbbox("Hg", anchor="ls")[1::2]
+    baseline = y - (top + bottom) / 2 if anchor[1] == "m" else y
+    for t, f in font.runs(text):
+        draw.text((x, baseline), t, font=f, fill=fill, anchor="ls")
+        x += f.getlength(t)
 
 
 @dataclass
@@ -40,16 +98,6 @@ class Entry:
     avatar: bytes | None = None
 
 
-def _font(size: int, candidates: list[str] = BOLD_CANDIDATES) -> ImageFont.FreeTypeFont:
-    for path in candidates:
-        if os.path.exists(path):
-            try:
-                return ImageFont.truetype(path, size)
-            except OSError:
-                continue
-    return ImageFont.load_default(size)
-
-
 def format_eur(amount: float) -> str:
     txt = f"{amount:,.2f}".replace(",", " ").replace(".", ",")
     if txt.endswith(",00"):
@@ -57,10 +105,10 @@ def format_eur(amount: float) -> str:
     return f"{txt} €"
 
 
-def _fit(draw: ImageDraw.ImageDraw, text: str, font, max_w: int) -> str:
-    if draw.textlength(text, font=font) <= max_w:
+def _fit(draw: ImageDraw.ImageDraw, text: str, font: RichFont, max_w: int) -> str:
+    if _width(text, font) <= max_w:
         return text
-    while text and draw.textlength(text + "…", font=font) > max_w:
+    while text and _width(text + "…", font) > max_w:
         text = text[:-1]
     return text + "…"
 
@@ -85,9 +133,9 @@ def _glow(img: Image.Image, center: tuple[int, int], radius: int, color: tuple, 
 def _initials_avatar(name: str, size: int, color: tuple) -> Image.Image:
     img = _gradient(size, size, color, tuple(max(0, c - 90) for c in color)).convert("RGBA")
     d = ImageDraw.Draw(img, "RGBA")
-    letters = "".join(p[0] for p in name.split()[:2] if p).upper() or "?"
+    letters = "".join(next((c for c in p if c.isalnum()), "") for p in name.split()[:2]).upper() or "?"
     f = _font(int(size * 0.4))
-    d.text((size / 2, size / 2), letters, font=f, fill=WHITE, anchor="mm")
+    _text(d, (size / 2, size / 2), letters, font=f, fill=WHITE, anchor="mm")
     return img
 
 
@@ -164,30 +212,30 @@ def render(entries: list[Entry], total: float, title: str = "CAGNOTTE") -> bytes
     # --- En-tête ---
     f_title = _font(44)
     spaced = "  ".join(title.upper())
-    d.text((WIDTH / 2, 88), spaced, font=f_title, fill=MUTED, anchor="mm")
-    f_total = _font(132, BLACK_CANDIDATES)
+    _text(d, (WIDTH / 2, 88), spaced, font=f_title, fill=MUTED, anchor="mm")
+    f_total = _font(132, "black")
     total_txt = format_eur(total)
-    while d.textlength(total_txt, font=f_total) > WIDTH - 120 and f_total.size > 60:
-        f_total = _font(f_total.size - 6, BLACK_CANDIDATES)
+    while _width(total_txt, f_total) > WIDTH - 120 and f_total.size > 60:
+        f_total = _font(f_total.size - 6, "black")
     # léger halo doré derrière le montant
     halo = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    ImageDraw.Draw(halo).text((WIDTH / 2, 205), total_txt, font=f_total, fill=GOLD + (150,), anchor="mm")
+    _text(ImageDraw.Draw(halo), (WIDTH / 2, 205), total_txt, font=f_total, fill=GOLD + (150,), anchor="mm")
     halo = halo.filter(ImageFilter.GaussianBlur(22))
     img.paste(halo, (0, 0), halo)
     d = ImageDraw.Draw(img, "RGBA")
-    d.text((WIDTH / 2, 205), total_txt, font=f_total, fill=GOLD, anchor="mm")
+    _text(d, (WIDTH / 2, 205), total_txt, font=f_total, fill=GOLD, anchor="mm")
     n = len(entries)
     sub = f"{n} participant{'s' if n > 1 else ''}"
     f_sub = _font(34)
-    sw = d.textlength(sub, font=f_sub) + 60
+    sw = _width(sub, f_sub) + 60
     d.rounded_rectangle((WIDTH / 2 - sw / 2, 285, WIDTH / 2 + sw / 2, 339), radius=27,
                         fill=(255, 255, 255, 28), outline=(255, 255, 255, 60), width=2)
-    d.text((WIDTH / 2, 312), sub, font=f_sub, fill=WHITE, anchor="mm")
+    _text(d, (WIDTH / 2, 312), sub, font=f_sub, fill=WHITE, anchor="mm")
 
     # --- Podium ---
     y0 = header_h
     if not podium:
-        d.text((WIDTH / 2, y0 + 70), "Aucune contribution pour l'instant", font=_font(38), fill=MUTED, anchor="mm")
+        _text(d, (WIDTH / 2, y0 + 70), "Aucune contribution pour l'instant", font=_font(38), fill=MUTED, anchor="mm")
     else:
         # ordre visuel : 2e - 1er - 3e
         slots = {0: (WIDTH // 2, 240, 0), 1: (WIDTH // 2 - 330, 190, 70), 2: (WIDTH // 2 + 330, 170, 95)}
@@ -207,14 +255,16 @@ def render(entries: list[Entry], total: float, title: str = "CAGNOTTE") -> bytes
             ImageDraw.Draw(m).rounded_rectangle((0, 0, bw * SS - 1, bh * SS + 60 * SS), radius=26 * SS, fill=255)
             img.paste(step, (box[0], box[1]), m.resize((bw, bh), Image.LANCZOS))
             d = ImageDraw.Draw(img, "RGBA")
-            d.text((cx, box[1] + bh / 2), str(rank + 1), font=_font(84 if rank == 0 else 70, BLACK_CANDIDATES),
+            _text(d, (cx, box[1] + bh / 2), str(rank + 1), font=_font(84 if rank == 0 else 70, "black"),
                    fill=(255, 255, 255, 235), anchor="mm")
 
             # montant + nom au-dessus de la marche
             f_amt = _font(44 if rank == 0 else 38)
-            d.text((cx, box[1] - 34), format_eur(entry.amount), font=f_amt, fill=color, anchor="mm")
+            _text(d, (cx, box[1] - 34), format_eur(entry.amount), font=f_amt, fill=color, anchor="mm")
             f_name = _font(34 if rank == 0 else 30)
-            d.text((cx, box[1] - 82), _fit(d, entry.name, f_name, 300), font=f_name, fill=WHITE, anchor="mm")
+            while _width(entry.name, f_name) > 310 and f_name.size > 22:
+                f_name = _font(f_name.size - 2)
+            _text(d, (cx, box[1] - 82), _fit(d, entry.name, f_name, 310), font=f_name, fill=WHITE, anchor="mm")
 
             # avatar
             av_bottom = box[1] - 118
@@ -230,21 +280,21 @@ def render(entries: list[Entry], total: float, title: str = "CAGNOTTE") -> bytes
     if rest:
         y = header_h + podium_h + 20
         top_amount = entries[0].amount or 1
-        f_rank = _font(34, BLACK_CANDIDATES)
+        f_rank = _font(34, "black")
         f_name = _font(34)
         f_amt = _font(34)
         for i, entry in enumerate(rest, start=4):
             box = (60, y, WIDTH - 60, y + row_h - 18)
             d.rounded_rectangle(box, radius=24, fill=(255, 255, 255, 20), outline=(255, 255, 255, 38), width=2)
             cy = (box[1] + box[3]) // 2
-            d.text((112, cy), f"{i}", font=f_rank, fill=MUTED, anchor="mm")
+            _text(d, (112, cy), f"{i}", font=f_rank, fill=MUTED, anchor="mm")
             av = _circle_avatar(entry, 62, (124, 92, 255), 3)
             img.paste(av, (160, cy - 31), av)
             d = ImageDraw.Draw(img, "RGBA")
             amt = format_eur(entry.amount)
-            amt_w = d.textlength(amt, font=f_amt)
-            d.text((WIDTH - 96, cy - 10), amt, font=f_amt, fill=WHITE, anchor="rm")
-            d.text((244, cy - 10), _fit(d, entry.name, f_name, int(WIDTH - 96 - amt_w - 290)), font=f_name, fill=WHITE, anchor="lm")
+            amt_w = _width(amt, f_amt)
+            _text(d, (WIDTH - 96, cy - 10), amt, font=f_amt, fill=WHITE, anchor="rm")
+            _text(d, (244, cy - 10), _fit(d, entry.name, f_name, int(WIDTH - 96 - amt_w - 290)), font=f_name, fill=WHITE, anchor="lm")
             # barre de progression relative au premier
             bar_x0, bar_x1, bar_y = 244, WIDTH - 96, cy + 22
             d.rounded_rectangle((bar_x0, bar_y, bar_x1, bar_y + 8), radius=4, fill=(255, 255, 255, 30))
@@ -255,7 +305,7 @@ def render(entries: list[Entry], total: float, title: str = "CAGNOTTE") -> bytes
     # --- Pied de page ---
     extra = len(entries) - 10
     footer = f"+ {extra} autre{'s' if extra > 1 else ''} participant{'s' if extra > 1 else ''}" if extra > 0 else "/top <montant> pour participer"
-    d.text((WIDTH / 2, height - footer_h / 2), footer, font=_font(28), fill=MUTED, anchor="mm")
+    _text(d, (WIDTH / 2, height - footer_h / 2), footer, font=_font(28), fill=MUTED, anchor="mm")
 
     out = io.BytesIO()
     img.save(out, format="PNG", optimize=True)
